@@ -1,0 +1,20 @@
+[package]
+name = "audiomock-integration"
+version = "0.1.0"
+edition = "2024"
+
+# This crate exists only for integration tests
+[[test]]
+name = "integration"
+path = "src/integration.rs"
+harness = true
+
+[dependencies]
+audiomock-proto = { path = "../audiomock-proto" }
+anyhow = { workspace = true }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+gstreamer = "0.23"
+gstreamer-app = "0.23"
+gstreamer-audio = "0.23"
+tempfile = "3"

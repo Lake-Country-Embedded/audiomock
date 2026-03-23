@@ -1,0 +1,18 @@
+[package]
+name = "audiomock"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "audiomock"
+path = "src/main.rs"
+
+[dependencies]
+audiomock-proto = { path = "../audiomock-proto" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }

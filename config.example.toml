@@ -1,0 +1,15 @@
+[daemon]
+# socket_path = "/run/user/1000/audiomockd.sock"  # default: $XDG_RUNTIME_DIR/audiomockd.sock
+log_level = "info"
+
+[audio]
+default_sample_rate = 48000
+default_channels = 2
+default_sample_format = "F32LE"
+buffer_size = 1024
+
+[[device_pairs]]
+name = "qemu-audio-0"
+source_description = "QEMU Virtual Mic 0"
+sink_description = "QEMU Virtual Speaker 0"
+# auto_link_pattern = "QEMU"
