@@ -1,0 +1,17 @@
+[Unit]
+Description=Audiomock Virtual Audio Device Daemon
+Documentation=https://github.com/Lake-Country-Embedded/audiomock
+After=pipewire.service
+Requires=pipewire.service
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/audiomockd --config %h/.config/audiomock/config.toml
+Restart=on-failure
+RestartSec=3
+
+# Environment
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=default.target
