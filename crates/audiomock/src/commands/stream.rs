@@ -2,7 +2,6 @@ use anyhow::{bail, Result};
 use audiomock_proto::audio::SampleFormat;
 use audiomock_proto::device::StreamDirection;
 use audiomock_proto::protocol::{Request, Response};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::client::Client;
 

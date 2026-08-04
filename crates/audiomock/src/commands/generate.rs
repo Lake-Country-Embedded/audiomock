@@ -51,12 +51,12 @@ pub async fn run(
                 let mut client = Client::connect(socket_path).await?;
                 client.send(&Request::Stop { device }).await?;
                 println!("\nStopped.");
-            } else if !continuous {
-                if let Some(d) = duration {
-                    println!("Playing for {d}s...");
-                    tokio::time::sleep(std::time::Duration::from_secs_f64(d)).await;
-                    println!("Done.");
-                }
+            } else if !continuous
+                && let Some(d) = duration
+            {
+                println!("Playing for {d}s...");
+                tokio::time::sleep(std::time::Duration::from_secs_f64(d)).await;
+                println!("Done.");
             }
         }
         Response::Error { message } => {

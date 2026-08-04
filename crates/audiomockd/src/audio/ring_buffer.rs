@@ -44,9 +44,9 @@ impl RingBuffer {
 
         let buf_ptr = self.buffer.as_ptr() as *mut f32;
 
-        for i in 0..to_write {
+        for &sample in &data[..to_write] {
             unsafe {
-                *buf_ptr.add(w) = data[i];
+                *buf_ptr.add(w) = sample;
             }
             w += 1;
             if w >= self.capacity {
@@ -64,8 +64,8 @@ impl RingBuffer {
         let to_read = output.len().min(avail);
         let mut r = self.read_pos.load(Ordering::Relaxed);
 
-        for i in 0..to_read {
-            output[i] = self.buffer[r];
+        for out in output.iter_mut().take(to_read) {
+            *out = self.buffer[r];
             r += 1;
             if r >= self.capacity {
                 r = 0;
