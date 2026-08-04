@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::audio::AudioFormat;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DaemonConfig {
     #[serde(default)]
@@ -20,6 +22,7 @@ impl Default for DaemonConfig {
                 source_description: Some("Virtual Mic".to_string()),
                 sink_description: Some("Virtual Speaker".to_string()),
                 auto_link_pattern: None,
+                autoconnect: false,
             }],
         }
     }
@@ -81,12 +84,32 @@ fn default_buffer_size() -> u32 {
     1024
 }
 
+impl AudioSection {
+    /// Build the stream format from config, validating the sample format string.
+    ///
+    /// Returns an error rather than silently falling back, so a typo in
+    /// `default_sample_format` surfaces at startup instead of being ignored.
+    pub fn format(&self) -> Result<AudioFormat, String> {
+        Ok(AudioFormat {
+            sample_rate: self.default_sample_rate,
+            channels: self.default_channels,
+            sample_format: self.default_sample_format.parse()?,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DevicePairConfig {
     pub name: String,
     pub source_description: Option<String>,
     pub sink_description: Option<String>,
+    /// If set, link this pair to PipeWire nodes matching this pattern as soon
+    /// as the pair is created.
     pub auto_link_pattern: Option<String>,
+    /// Let PipeWire pick a target for these streams. Off by default so a test
+    /// rig only ever carries links it asked for.
+    #[serde(default)]
+    pub autoconnect: bool,
 }
 
 impl DaemonConfig {

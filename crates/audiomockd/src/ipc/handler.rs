@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use audiomock_proto::audio::OutputFormat;
 use audiomock_proto::protocol::{Request, Response};
 use tokio::sync::Mutex;
 
@@ -53,6 +54,7 @@ pub async fn handle_request(
             name,
             source_description,
             sink_description,
+            autoconnect,
         } => {
             let (tx, rx) = tokio::sync::oneshot::channel();
             let source_desc = source_description.unwrap_or_else(|| format!("{name} Source"));
@@ -61,6 +63,7 @@ pub async fn handle_request(
                 name: name.clone(),
                 source_description: source_desc,
                 sink_description: sink_desc,
+                autoconnect,
                 reply: tx,
             }) {
                 return Response::Error {
@@ -159,15 +162,27 @@ pub async fn handle_request(
         Request::Record {
             device,
             file_path,
-            format: _,
-            duration_secs: _,
-            sample_rate: _,
-            channels: _,
+            format,
+            duration_secs,
+            sample_rate,
+            channels,
         } => {
+            let out_format = format
+                .or_else(|| {
+                    std::path::Path::new(&file_path)
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .and_then(OutputFormat::from_extension)
+                })
+                .unwrap_or(OutputFormat::Wav);
             let (tx, rx) = tokio::sync::oneshot::channel();
             if let Err(e) = st.pw_handle.send(PwCommand::StartRecord {
                 device: device.clone(),
                 file_path,
+                out_format,
+                duration_secs,
+                sample_rate,
+                channels,
                 reply: tx,
             }) {
                 return Response::Error {
@@ -236,6 +251,74 @@ pub async fn handle_request(
                 Ok(Err(e)) => Response::Error { message: e },
                 Err(e) => Response::Error {
                     message: format!("Channel error: {e}"),
+                },
+            }
+        }
+
+        Request::Loopback { device } => {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            if let Err(e) = st.pw_handle.send(PwCommand::StartLoopback {
+                device: device.clone(),
+                reply: tx,
+            }) {
+                return Response::Error {
+                    message: format!("Failed to send command: {e}"),
+                };
+            }
+            drop(st);
+            match rx.await {
+                Ok(Ok(())) => Response::LoopbackStarted { device },
+                Ok(Err(e)) => Response::Error { message: e },
+                Err(e) => Response::Error {
+                    message: format!("Channel error: {e}"),
+                },
+            }
+        }
+
+        Request::Link {
+            device,
+            pattern,
+            exclusive,
+        } => {
+            let pattern = pattern.unwrap_or_else(|| st.default_link_pattern());
+            drop(st);
+            let dev = device.clone();
+            // Shells out to pw-link, so keep it off the async reactor.
+            let result = tokio::task::spawn_blocking(move || {
+                crate::linker::link_device(&dev, &pattern, exclusive)
+            })
+            .await;
+            match result {
+                Ok(Ok(r)) => Response::Linked {
+                    device,
+                    created: r.created,
+                    removed: r.removed,
+                },
+                Ok(Err(e)) => Response::Error {
+                    message: e.to_string(),
+                },
+                Err(e) => Response::Error {
+                    message: format!("Join error: {e}"),
+                },
+            }
+        }
+
+        Request::Unlink { device } => {
+            drop(st);
+            let dev = device.clone();
+            let result =
+                tokio::task::spawn_blocking(move || crate::linker::unlink_device(&dev)).await;
+            match result {
+                Ok(Ok(r)) => Response::Linked {
+                    device,
+                    created: 0,
+                    removed: r.removed,
+                },
+                Ok(Err(e)) => Response::Error {
+                    message: e.to_string(),
+                },
+                Err(e) => Response::Error {
+                    message: format!("Join error: {e}"),
                 },
             }
         }

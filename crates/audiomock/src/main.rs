@@ -8,11 +8,11 @@ use clap::{Parser, Subcommand};
 #[command(name = "audiomock", about = "CLI tool for audiomockd virtual audio devices")]
 struct Cli {
     /// Override daemon socket path
-    #[arg(long)]
+    #[arg(long, global = true)]
     socket: Option<String>,
 
     /// Output in JSON format
-    #[arg(long)]
+    #[arg(long, global = true)]
     json: bool,
 
     #[command(subcommand)]
@@ -127,9 +127,27 @@ enum Commands {
         #[arg(long, default_value = "default")]
         device: String,
 
-        /// QEMU node name pattern to match (default: "QEMU")
+        /// Node name pattern to match (default: "qemu")
         #[arg(long)]
         qemu_node: Option<String>,
+
+        /// Drop links other clients made to this pair before adding ours
+        #[arg(long)]
+        exclusive: bool,
+    },
+
+    /// Remove every link touching a virtual device pair
+    Unlink {
+        /// Target device pair
+        #[arg(long, default_value = "default")]
+        device: String,
+    },
+
+    /// Route a device's sink back into its own source
+    Loopback {
+        /// Target device pair
+        #[arg(long, default_value = "default")]
+        device: String,
     },
 
     /// Stop active playback/tone on a device
@@ -154,6 +172,9 @@ enum DeviceAction {
         source_description: Option<String>,
         #[arg(long)]
         sink_description: Option<String>,
+        /// Let PipeWire pick a target for these streams (off by default)
+        #[arg(long)]
+        autoconnect: bool,
     },
     /// Destroy a device pair
     Destroy { name: String },
@@ -181,9 +202,16 @@ async fn main() -> Result<()> {
                 name,
                 source_description,
                 sink_description,
+                autoconnect,
             } => {
-                commands::devices::create(&socket_path, name, source_description, sink_description)
-                    .await
+                commands::devices::create(
+                    &socket_path,
+                    name,
+                    source_description,
+                    sink_description,
+                    autoconnect,
+                )
+                .await
             }
             DeviceAction::Destroy { name } => {
                 commands::devices::destroy(&socket_path, name).await
@@ -236,7 +264,16 @@ async fn main() -> Result<()> {
         Commands::Link {
             device,
             qemu_node,
-        } => commands::link::run(&device, qemu_node.as_deref()).await,
+            exclusive,
+        } => {
+            commands::link::run(&socket_path, device, qemu_node, exclusive, json_output).await
+        }
+        Commands::Unlink { device } => {
+            commands::link::unlink(&socket_path, device, json_output).await
+        }
+        Commands::Loopback { device } => {
+            commands::loopback::run(&socket_path, device, json_output).await
+        }
         Commands::Stream {
             device,
             direction,

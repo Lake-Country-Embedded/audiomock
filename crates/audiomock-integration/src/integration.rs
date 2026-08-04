@@ -121,15 +121,14 @@ impl Drop for DaemonGuard {
 
 async fn setup_daemon(label: &str) -> Result<(DaemonGuard, String)> {
     let socket = test_socket_path(label);
-    let child = start_daemon(&socket);
+    // Build the guard before waiting, so a daemon that never comes up is still
+    // reaped by Drop on the early return instead of leaking a process.
+    let guard = DaemonGuard {
+        child: start_daemon(&socket),
+        socket_path: socket.clone(),
+    };
     wait_for_socket(&socket, Duration::from_secs(5)).await?;
-    Ok((
-        DaemonGuard {
-            child,
-            socket_path: socket.clone(),
-        },
-        socket,
-    ))
+    Ok((guard, socket))
 }
 
 // ---------------------------------------------------------------------------
@@ -257,17 +256,12 @@ fn decode_audio_file(path: &str, sample_rate: u32, channels: u16) -> Result<Vec<
     pipeline.set_state(gstreamer::State::Playing)?;
 
     let mut samples = Vec::new();
-    loop {
-        match appsink.pull_sample() {
-            Ok(sample) => {
-                let buffer = sample.buffer_owned().context("no buffer")?;
-                let map = buffer.map_readable().context("map failed")?;
-                let bytes = map.as_slice();
-                for chunk in bytes.chunks_exact(4) {
-                    samples.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
-                }
-            }
-            Err(_) => break,
+    while let Ok(sample) = appsink.pull_sample() {
+        let buffer = sample.buffer_owned().context("no buffer")?;
+        let map = buffer.map_readable().context("map failed")?;
+        let bytes = map.as_slice();
+        for chunk in bytes.chunks_exact(4) {
+            samples.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
         }
     }
 
@@ -328,6 +322,7 @@ async fn test_device_lifecycle() -> Result<()> {
             name: "test-dev".to_string(),
             source_description: Some("Test Source".to_string()),
             sink_description: Some("Test Sink".to_string()),
+            autoconnect: false,
         })
         .await?;
     assert!(matches!(resp, Response::DeviceCreated { .. }));
@@ -350,6 +345,7 @@ async fn test_device_lifecycle() -> Result<()> {
             name: "test-dev".to_string(),
             source_description: None,
             sink_description: None,
+            autoconnect: false,
         })
         .await?;
     assert!(matches!(resp, Response::Error { .. }));
@@ -702,11 +698,8 @@ async fn test_stream_in_with_frequency_validation() -> Result<()> {
     // Verify the stream-in is active
     let mut client2 = TestClient::connect(&socket).await?;
     let resp = client2.send(&Request::Status).await?;
-    match resp {
-        Response::Status { devices, .. } => {
-            eprintln!("Stream-in status: {:?}", devices[0].active_job);
-        }
-        _ => {}
+    if let Response::Status { devices, .. } = resp {
+        eprintln!("Stream-in status: {:?}", devices[0].active_job);
     }
 
     // Stop streaming
@@ -731,6 +724,7 @@ async fn test_multiple_devices_independent() -> Result<()> {
             name: "dev-b".to_string(),
             source_description: Some("Dev B Source".to_string()),
             sink_description: Some("Dev B Sink".to_string()),
+            autoconnect: false,
         })
         .await?;
     assert!(matches!(resp, Response::DeviceCreated { .. }));
@@ -1184,6 +1178,193 @@ async fn test_generate_different_frequencies() -> Result<()> {
         })
         .await?;
     }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_loopback_starts_and_reports() -> Result<()> {
+    // Loopback routes the sink back into the source inside the daemon, which
+    // is what avoids the PipeWire scheduling cycle a direct peer-to-peer link
+    // would create.
+    let (_guard, socket) = setup_daemon("loopback").await?;
+
+    let mut c1 = TestClient::connect(&socket).await?;
+    let resp = c1
+        .send(&Request::Loopback {
+            device: "default".to_string(),
+        })
+        .await?;
+    assert!(
+        matches!(resp, Response::LoopbackStarted { .. }),
+        "Expected LoopbackStarted, got: {resp:?}"
+    );
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let mut c2 = TestClient::connect(&socket).await?;
+    let resp = c2.send(&Request::Status).await?;
+    match resp {
+        Response::Status { devices, .. } => {
+            assert!(
+                matches!(
+                    devices[0].active_job,
+                    Some(audiomock_proto::device::ActiveJob::Loopback)
+                ),
+                "Expected Loopback job, got: {:?}",
+                devices[0].active_job
+            );
+        }
+        other => panic!("Expected Status, got: {other:?}"),
+    }
+
+    let mut c3 = TestClient::connect(&socket).await?;
+    c3.send(&Request::Stop {
+        device: "default".to_string(),
+    })
+    .await?;
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let mut c4 = TestClient::connect(&socket).await?;
+    match c4.send(&Request::Status).await? {
+        Response::Status { devices, .. } => {
+            assert!(
+                devices[0].active_job.is_none(),
+                "Loopback should clear on stop"
+            );
+        }
+        other => panic!("Expected Status, got: {other:?}"),
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_loopback_on_nonexistent_device() -> Result<()> {
+    let (_guard, socket) = setup_daemon("loopback-nodev").await?;
+    let mut client = TestClient::connect(&socket).await?;
+    let resp = client
+        .send(&Request::Loopback {
+            device: "ghost".to_string(),
+        })
+        .await?;
+    assert!(matches!(resp, Response::Error { .. }));
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_recording_auto_stops_on_duration() -> Result<()> {
+    // The client used to implement --duration by sleeping and then sending
+    // Stop, so a killed client lost the capture entirely. The daemon now owns
+    // the deadline: no Stop is sent here at all.
+    let (_guard, socket) = setup_daemon("rec-autostop").await?;
+    let dir = tempfile::tempdir()?;
+    let rec_path = dir.path().join("auto.wav");
+    let rec_str = rec_path.to_str().unwrap();
+
+    let mut c1 = TestClient::connect(&socket).await?;
+    let resp = c1
+        .send(&Request::Record {
+            device: "default".to_string(),
+            file_path: rec_str.to_string(),
+            format: Some(OutputFormat::Wav),
+            duration_secs: Some(1.0),
+            sample_rate: None,
+            channels: None,
+        })
+        .await?;
+    assert!(matches!(resp, Response::RecordStarted { .. }));
+
+    // Well past the deadline, but still no Stop from us.
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+
+    let mut c2 = TestClient::connect(&socket).await?;
+    match c2.send(&Request::Status).await? {
+        Response::Status { devices, .. } => {
+            assert!(
+                devices[0].active_job.is_none(),
+                "Recording should have auto-stopped, got: {:?}",
+                devices[0].active_job
+            );
+        }
+        other => panic!("Expected Status, got: {other:?}"),
+    }
+
+    // The file must be a complete WAV, with the header patched on finalize.
+    let bytes = std::fs::read(&rec_path)?;
+    assert!(bytes.len() >= 44, "WAV header missing");
+    assert_eq!(&bytes[0..4], b"RIFF");
+    assert_eq!(&bytes[8..12], b"WAVE");
+    let riff = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+    let data = u32::from_le_bytes(bytes[40..44].try_into().unwrap());
+    assert_eq!(riff, 36 + data, "RIFF size was never patched");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_unlink_is_safe_with_no_links() -> Result<()> {
+    let (_guard, socket) = setup_daemon("unlink").await?;
+    let mut client = TestClient::connect(&socket).await?;
+    let resp = client
+        .send(&Request::Unlink {
+            device: "default".to_string(),
+        })
+        .await?;
+    match resp {
+        Response::Linked { created, .. } => assert_eq!(created, 0),
+        other => panic!("Expected Linked, got: {other:?}"),
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_link_with_no_matching_nodes_errors() -> Result<()> {
+    let (_guard, socket) = setup_daemon("link-nomatch").await?;
+    let mut client = TestClient::connect(&socket).await?;
+    let resp = client
+        .send(&Request::Link {
+            device: "default".to_string(),
+            pattern: Some("no-such-node-zzz".to_string()),
+            exclusive: false,
+        })
+        .await?;
+    assert!(
+        matches!(resp, Response::Error { .. }),
+        "Expected an error for an unmatched pattern, got: {resp:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_recording_honors_requested_rate_and_channels() -> Result<()> {
+    // These were dropped on the floor by the daemon before.
+    let (_guard, socket) = setup_daemon("rec-convert").await?;
+    let dir = tempfile::tempdir()?;
+    let rec_path = dir.path().join("mono8k.wav");
+    let rec_str = rec_path.to_str().unwrap();
+
+    let mut c1 = TestClient::connect(&socket).await?;
+    let resp = c1
+        .send(&Request::Record {
+            device: "default".to_string(),
+            file_path: rec_str.to_string(),
+            format: Some(OutputFormat::Wav),
+            duration_secs: Some(1.0),
+            sample_rate: Some(8000),
+            channels: Some(1),
+        })
+        .await?;
+    assert!(matches!(resp, Response::RecordStarted { .. }));
+
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+
+    let bytes = std::fs::read(&rec_path)?;
+    assert!(bytes.len() >= 44, "WAV header missing");
+    let channels = u16::from_le_bytes(bytes[22..24].try_into().unwrap());
+    let rate = u32::from_le_bytes(bytes[24..28].try_into().unwrap());
+    assert_eq!(channels, 1, "requested mono output");
+    assert_eq!(rate, 8000, "requested 8 kHz output");
 
     Ok(())
 }

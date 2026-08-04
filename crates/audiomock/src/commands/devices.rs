@@ -44,6 +44,7 @@ pub async fn create(
     name: String,
     source_description: Option<String>,
     sink_description: Option<String>,
+    autoconnect: bool,
 ) -> Result<()> {
     let mut client = Client::connect(socket_path).await?;
     let response = client
@@ -51,6 +52,7 @@ pub async fn create(
             name,
             source_description,
             sink_description,
+            autoconnect,
         })
         .await?;
 

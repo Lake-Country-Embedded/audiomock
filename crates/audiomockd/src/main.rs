@@ -1,6 +1,7 @@
 mod audio;
 mod daemon;
 mod ipc;
+mod linker;
 mod pipewire;
 
 use anyhow::Result;

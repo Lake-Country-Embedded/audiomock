@@ -3,7 +3,7 @@ pub mod format;
 pub mod virtual_node;
 
 use anyhow::Result;
-use audiomock_proto::audio::{SampleFormat, WaveformKind};
+use audiomock_proto::audio::{OutputFormat, WaveformKind};
 use audiomock_proto::config::DaemonConfig;
 use audiomock_proto::device::{DeviceInfo, StreamDirection};
 use crossbeam_channel::Sender;
@@ -15,6 +15,7 @@ pub enum PwCommand {
         name: String,
         source_description: String,
         sink_description: String,
+        autoconnect: bool,
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
     DestroyDevice {
@@ -46,6 +47,14 @@ pub enum PwCommand {
     StartRecord {
         device: String,
         file_path: String,
+        out_format: OutputFormat,
+        duration_secs: Option<f64>,
+        sample_rate: Option<u32>,
+        channels: Option<u16>,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
+    StartLoopback {
+        device: String,
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
     StartStream {
@@ -67,6 +76,23 @@ impl PipewireHandle {
     pub fn send(&self, cmd: PwCommand) -> Result<()> {
         self.cmd_tx.send(cmd)?;
         Ok(())
+    }
+
+    /// Ask the PipeWire loop to quit and wait for the thread to unwind, so
+    /// streams are torn down and in-flight recordings finalized before exit.
+    pub fn shutdown(&mut self) {
+        let _ = self.cmd_tx.send(PwCommand::Shutdown);
+        if let Some(handle) = self.thread.take()
+            && handle.join().is_err()
+        {
+            tracing::error!("PipeWire thread panicked during shutdown");
+        }
+    }
+}
+
+impl Drop for PipewireHandle {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }
 

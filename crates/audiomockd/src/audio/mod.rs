@@ -1,3 +1,3 @@
 pub mod decoder;
-pub mod encoder;
+pub mod recorder;
 pub mod ring_buffer;

@@ -4,7 +4,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use anyhow::Result;
-use audiomock_proto::audio::{AudioFormat, WaveformKind};
+use audiomock_proto::audio::{AudioFormat, OutputFormat, SampleFormat, WaveformKind};
 use audiomock_proto::device::{ActiveJob, DeviceInfo, StreamDirection};
 use pipewire as pw;
 use pw::spa;
@@ -12,9 +12,51 @@ use pw::spa::pod::Pod;
 use pw::stream::{Stream, StreamFlags, StreamRef};
 
 use super::format;
+use crate::audio::recorder::Recorder;
 use crate::audio::ring_buffer::RingBuffer;
 
-const CHAN_SIZE: usize = std::mem::size_of::<f32>();
+/// Loopback ring size in interleaved samples: ~200 ms at 48 kHz stereo, small
+/// enough that a guest hearing itself is not listening to stale audio.
+const LOOPBACK_CAPACITY: usize = 19_200;
+
+/// Silence pre-loaded into the loopback ring, ~50 ms at 48 kHz stereo.
+///
+/// The source and sink callbacks both run once per graph cycle, and the source
+/// may well run first. Starting from an empty ring it would then read zeros
+/// every cycle and only pick up stragglers, which passes audio through at a
+/// level tens of dB below the original. The cushion keeps a whole quantum in
+/// hand so each read is satisfied in full.
+const LOOPBACK_PRIME: usize = 4_800;
+
+/// Convert a normalized f32 sample into `fmt` and write it at `dst`.
+#[inline]
+fn write_sample(dst: &mut [u8], v: f32, fmt: SampleFormat) {
+    match fmt {
+        SampleFormat::F32LE => dst.copy_from_slice(&v.to_le_bytes()),
+        SampleFormat::S16LE => {
+            let s = (v.clamp(-1.0, 1.0) * 32767.0) as i16;
+            dst.copy_from_slice(&s.to_le_bytes());
+        }
+        SampleFormat::S32LE => {
+            let s = (v.clamp(-1.0, 1.0) * 2_147_483_647.0) as i32;
+            dst.copy_from_slice(&s.to_le_bytes());
+        }
+    }
+}
+
+/// Read one sample of `fmt` from `src` and normalize it to f32.
+#[inline]
+fn read_sample(src: &[u8], fmt: SampleFormat) -> f32 {
+    match fmt {
+        SampleFormat::F32LE => f32::from_le_bytes(src.try_into().unwrap_or([0; 4])),
+        SampleFormat::S16LE => {
+            i16::from_le_bytes(src.try_into().unwrap_or([0; 2])) as f32 / 32768.0
+        }
+        SampleFormat::S32LE => {
+            i32::from_le_bytes(src.try_into().unwrap_or([0; 4])) as f32 / 2_147_483_648.0
+        }
+    }
+}
 
 /// Shared state for the virtual source, accessible from both commands and callbacks.
 pub struct SourceState {
@@ -31,7 +73,8 @@ pub struct SourceState {
     pub playback_loop_count: Option<u32>,
     pub playback_loops_done: u32,
     pub playback_volume: f32,
-    /// Ring buffer for stream-in: IPC writes, process callback reads.
+    /// Ring buffer for stream-in and loopback: written elsewhere, read by the
+    /// process callback.
     pub stream_in_buffer: Option<Arc<RingBuffer>>,
 }
 
@@ -39,10 +82,20 @@ pub struct SourceState {
 pub struct SinkState {
     pub format: AudioFormat,
     pub active_job: Option<ActiveJob>,
-    pub record_buffer: Vec<f32>,
-    pub record_file_path: Option<String>,
+    pub recorder: Option<Recorder>,
+    /// Interleaved-sample budget for a duration-limited recording.
+    pub record_limit_samples: Option<u64>,
+    pub record_samples: u64,
+    /// Wall-clock stop time. Sample counting alone would never expire on a
+    /// sink that no peer is driving, so a silent capture would hang forever.
+    pub record_deadline: Option<std::time::Instant>,
+    /// Set by the callback when the budget runs out; finalized off the
+    /// real-time thread by `DevicePair::poll`.
+    pub record_complete: bool,
     /// Ring buffer for stream-out: process callback writes, IPC reads.
     pub stream_out_buffer: Option<Arc<RingBuffer>>,
+    /// Ring buffer for loopback: process callback writes, source reads.
+    pub loopback_buffer: Option<Arc<RingBuffer>>,
 }
 
 pub struct DevicePair {
@@ -65,6 +118,8 @@ impl DevicePair {
         source_desc: &str,
         sink_desc: &str,
         audio_format: &AudioFormat,
+        autoconnect: bool,
+        buffer_size: u32,
     ) -> Result<Self> {
         let source_state = Rc::new(RefCell::new(SourceState {
             format: *audio_format,
@@ -86,10 +141,24 @@ impl DevicePair {
         let sink_state = Rc::new(RefCell::new(SinkState {
             format: *audio_format,
             active_job: None,
-            record_buffer: Vec::new(),
-            record_file_path: None,
+            recorder: None,
+            record_limit_samples: None,
+            record_samples: 0,
+            record_deadline: None,
+            record_complete: false,
             stream_out_buffer: None,
+            loopback_buffer: None,
         }));
+
+        // Requested quantum, honoring the configured buffer size.
+        let latency = format!("{}/{}", buffer_size.max(1), audio_format.sample_rate);
+
+        // Without AUTOCONNECT the session manager leaves these streams alone,
+        // so the graph only ever holds links we asked for.
+        let mut flags = StreamFlags::MAP_BUFFERS | StreamFlags::RT_PROCESS;
+        if autoconnect {
+            flags |= StreamFlags::AUTOCONNECT;
+        }
 
         // --- Source stream (virtual mic, produces audio) ---
         // Use Stream/Output/Audio so PipeWire exposes output ports that
@@ -100,6 +169,7 @@ impl DevicePair {
             *pw::keys::MEDIA_CATEGORY => "Playback",
             *pw::keys::MEDIA_CLASS => "Stream/Output/Audio",
             *pw::keys::NODE_NAME => format!("audiomock-source-{name}"),
+            *pw::keys::NODE_LATENCY => latency.clone(),
             "node.always-process" => "true",
             "node.want-driver" => "true",
             *pw::keys::NODE_DESCRIPTION => source_desc,
@@ -108,13 +178,12 @@ impl DevicePair {
         let source_stream =
             Stream::new(core, &format!("audiomock-source-{name}"), source_props)?;
 
-        let channels = audio_format.channels;
         let src_state_ref = source_state.clone();
 
         let source_listener = source_stream
             .add_local_listener_with_user_data(())
             .process(move |stream, _| {
-                source_process(stream, &src_state_ref, channels);
+                source_process(stream, &src_state_ref);
             })
             .register()?;
 
@@ -124,7 +193,7 @@ impl DevicePair {
         source_stream.connect(
             spa::utils::Direction::Output,
             None,
-            StreamFlags::AUTOCONNECT | StreamFlags::MAP_BUFFERS | StreamFlags::RT_PROCESS,
+            flags,
             &mut params,
         )?;
 
@@ -136,6 +205,7 @@ impl DevicePair {
             *pw::keys::MEDIA_CATEGORY => "Capture",
             *pw::keys::MEDIA_CLASS => "Stream/Input/Audio",
             *pw::keys::NODE_NAME => format!("audiomock-sink-{name}"),
+            *pw::keys::NODE_LATENCY => latency,
             "node.always-process" => "true",
             "node.want-driver" => "true",
             *pw::keys::NODE_DESCRIPTION => sink_desc,
@@ -158,7 +228,7 @@ impl DevicePair {
         sink_stream.connect(
             spa::utils::Direction::Input,
             None,
-            StreamFlags::AUTOCONNECT | StreamFlags::MAP_BUFFERS | StreamFlags::RT_PROCESS,
+            flags,
             &mut sink_params,
         )?;
 
@@ -186,6 +256,43 @@ impl DevicePair {
             sink_description: self.sink_description.clone(),
             format: src.format,
             active_job,
+        }
+    }
+
+    /// Finalize work the real-time callback flagged but must not do itself.
+    /// Called from the daemon's command timer.
+    pub fn poll(&mut self) {
+        if tracing::enabled!(tracing::Level::DEBUG)
+            && let Ok(st) = self.sink_state.try_borrow()
+            && let Some(rb) = st.loopback_buffer.as_ref()
+        {
+            tracing::debug!(
+                "loopback ring on '{}': {} samples queued",
+                self.name,
+                rb.available()
+            );
+        }
+        let finished = {
+            let mut st = match self.sink_state.try_borrow_mut() {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            let expired = st
+                .record_deadline
+                .is_some_and(|d| std::time::Instant::now() >= d);
+            if !st.record_complete && !expired {
+                return;
+            }
+            st.record_complete = false;
+            st.active_job = None;
+            st.record_limit_samples = None;
+            st.record_deadline = None;
+            st.record_samples = 0;
+            st.recorder.take()
+        };
+        if let Some(rec) = finished {
+            tracing::info!("Recording duration reached on '{}'", self.name);
+            rec.finish();
         }
     }
 
@@ -224,24 +331,19 @@ impl DevicePair {
             state.playback_pos = 0;
             state.stream_in_buffer = None;
         }
-        {
+        let recorder = {
             let mut state = self.sink_state.borrow_mut();
             state.active_job = None;
-            let buf_len = state.record_buffer.len();
-            if let Some(ref path) = state.record_file_path {
-                tracing::info!(
-                    "Flushing recording: {} samples to '{path}'",
-                    buf_len
-                );
-                if buf_len > 0 {
-                    flush_recording(&state.record_buffer, path, &state.format);
-                } else {
-                    tracing::warn!("Recording buffer is empty — sink received no audio");
-                }
-            }
-            state.record_buffer.clear();
-            state.record_file_path = None;
             state.stream_out_buffer = None;
+            state.loopback_buffer = None;
+            state.record_limit_samples = None;
+            state.record_deadline = None;
+            state.record_samples = 0;
+            state.record_complete = false;
+            state.recorder.take()
+        };
+        if let Some(rec) = recorder {
+            rec.finish();
         }
         tracing::info!("Stopped job on '{}'", self.name);
     }
@@ -295,23 +397,69 @@ impl DevicePair {
         rb
     }
 
-    pub fn start_recording(&mut self, file_path: &str) -> Result<()> {
+    /// Route this pair's sink back into its own source.
+    ///
+    /// The audio makes the trip inside the daemon, so the two peer nodes are
+    /// never linked to each other and no scheduling cycle can form in the
+    /// PipeWire graph.
+    pub fn start_loopback(&mut self) {
+        let rb = RingBuffer::new(LOOPBACK_CAPACITY);
+        rb.write(&vec![0.0f32; LOOPBACK_PRIME]);
+        {
+            let mut sink = self.sink_state.borrow_mut();
+            sink.loopback_buffer = Some(rb.clone());
+            sink.active_job = Some(ActiveJob::Loopback);
+        }
+        {
+            let mut src = self.source_state.borrow_mut();
+            src.stream_in_buffer = Some(rb);
+            src.active_job = Some(ActiveJob::Loopback);
+        }
+        tracing::info!("Started loopback on '{}'", self.name);
+    }
+
+    pub fn start_recording(
+        &mut self,
+        file_path: &str,
+        out_format: OutputFormat,
+        duration_secs: Option<f64>,
+        sample_rate: Option<u32>,
+        channels: Option<u16>,
+    ) -> Result<()> {
+        let format = self.sink_state.borrow().format;
+        let recorder = Recorder::start(
+            file_path,
+            out_format,
+            &format,
+            sample_rate,
+            channels,
+        )?;
+
         let mut state = self.sink_state.borrow_mut();
-        let old_len = state.record_buffer.len();
-        state.record_buffer.clear();
-        state.record_file_path = Some(file_path.to_string());
+        state.record_limit_samples = duration_secs.map(|d| {
+            (d * format.sample_rate as f64) as u64 * format.channels as u64
+        });
+        state.record_deadline = duration_secs.map(|d| {
+            // Small grace period so the sample budget, which is exact, wins
+            // whenever audio is actually flowing.
+            std::time::Instant::now()
+                + std::time::Duration::from_secs_f64(d + 0.5)
+        });
+        state.record_samples = 0;
+        state.record_complete = false;
+        state.recorder = Some(recorder);
         state.active_job = Some(ActiveJob::Recording {
             file_path: file_path.to_string(),
         });
         tracing::info!(
-            "Starting recording to '{file_path}' on '{}' (cleared {} old samples)",
-            self.name, old_len
+            "Starting {out_format} recording to '{file_path}' on '{}'",
+            self.name
         );
         Ok(())
     }
 }
 
-fn source_process(stream: &StreamRef, state: &Rc<RefCell<SourceState>>, channels: u16) {
+fn source_process(stream: &StreamRef, state: &Rc<RefCell<SourceState>>) {
     let mut buffer = match stream.dequeue_buffer() {
         Some(b) => b,
         None => return,
@@ -320,7 +468,8 @@ fn source_process(stream: &StreamRef, state: &Rc<RefCell<SourceState>>, channels
     // How many frames the graph actually wants this cycle. The mapped buffer
     // is far larger than one quantum, so filling all of it makes the node
     // produce long bursts at long intervals instead of a steady stream. That
-    // is inaudible for a continuous tone but wrecks anything rate-coupled.
+    // is inaudible for a continuous tone but wrecks anything rate-coupled,
+    // such as draining a loopback ring.
     let requested = buffer.requested() as usize;
 
     let datas = buffer.datas_mut();
@@ -329,7 +478,16 @@ fn source_process(stream: &StreamRef, state: &Rc<RefCell<SourceState>>, channels
     }
 
     let data = &mut datas[0];
-    let stride = CHAN_SIZE * channels as usize;
+
+    // Read the format before borrowing the buffer slice mutably.
+    let (channels, sample_fmt) = {
+        match state.try_borrow() {
+            Ok(st) => (st.format.channels as usize, st.format.sample_format),
+            Err(_) => return,
+        }
+    };
+    let bps = sample_fmt.bytes_per_sample();
+    let stride = bps * channels;
 
     let n_frames = if let Some(slice) = data.data() {
         let capacity_frames = slice.len() / stride;
@@ -372,12 +530,10 @@ fn source_process(stream: &StreamRef, state: &Rc<RefCell<SourceState>>, channels
                     };
 
                     let val = (sample * volume as f64) as f32;
-                    let val_bytes = f32::to_le_bytes(val);
 
-                    for c in 0..channels as usize {
-                        let start = i * stride + c * CHAN_SIZE;
-                        let end = start + CHAN_SIZE;
-                        slice[start..end].copy_from_slice(&val_bytes);
+                    for c in 0..channels {
+                        let start = i * stride + c * bps;
+                        write_sample(&mut slice[start..start + bps], val, sample_fmt);
                     }
 
                     st.tone_phase += phase_inc;
@@ -387,10 +543,10 @@ fn source_process(stream: &StreamRef, state: &Rc<RefCell<SourceState>>, channels
                 }
 
                 st.tone_samples_produced += n_frames as u64;
-                if let Some(max) = st.tone_duration_samples {
-                    if st.tone_samples_produced >= max {
-                        st.active_job = None;
-                    }
+                if let Some(max) = st.tone_duration_samples
+                    && st.tone_samples_produced >= max
+                {
+                    st.active_job = None;
                 }
             }
             Some(ActiveJob::Playback { .. }) => {
@@ -400,7 +556,7 @@ fn source_process(stream: &StreamRef, state: &Rc<RefCell<SourceState>>, channels
                 } else {
                     let vol = st.playback_volume;
                     'frames: for i in 0..n_frames {
-                        for c in 0..channels as usize {
+                        for c in 0..channels {
                             if st.playback_pos >= buf_len {
                                 match st.playback_loop_count {
                                     Some(0) => {
@@ -409,56 +565,49 @@ fn source_process(stream: &StreamRef, state: &Rc<RefCell<SourceState>>, channels
                                     Some(n) => {
                                         st.playback_loops_done += 1;
                                         if st.playback_loops_done >= n {
-                                            // Fill rest with silence
-                                            for j in i..n_frames {
-                                                for c2 in 0..channels as usize {
-                                                    let s = j * stride + c2 * CHAN_SIZE;
-                                                    let e = s + CHAN_SIZE;
-                                                    slice[s..e].copy_from_slice(
-                                                        &f32::to_le_bytes(0.0),
-                                                    );
-                                                }
-                                            }
+                                            fill_silence(
+                                                slice, i, n_frames, channels, stride, bps,
+                                                sample_fmt,
+                                            );
                                             st.active_job = None;
                                             break 'frames;
                                         }
                                         st.playback_pos = 0;
                                     }
                                     None => {
-                                        for j in i..n_frames {
-                                            for c2 in 0..channels as usize {
-                                                let s = j * stride + c2 * CHAN_SIZE;
-                                                let e = s + CHAN_SIZE;
-                                                slice[s..e]
-                                                    .copy_from_slice(&f32::to_le_bytes(0.0));
-                                            }
-                                        }
+                                        fill_silence(
+                                            slice, i, n_frames, channels, stride, bps,
+                                            sample_fmt,
+                                        );
                                         st.active_job = None;
                                         break 'frames;
                                     }
                                 }
                             }
                             let val = st.playback_buffer[st.playback_pos] * vol;
-                            let start = i * stride + c * CHAN_SIZE;
-                            let end = start + CHAN_SIZE;
-                            slice[start..end].copy_from_slice(&f32::to_le_bytes(val));
+                            let start = i * stride + c * bps;
+                            write_sample(&mut slice[start..start + bps], val, sample_fmt);
                             st.playback_pos += 1;
                         }
                     }
                 }
             }
-            Some(ActiveJob::Streaming { direction: StreamDirection::In }) => {
-                // Read from the stream-in ring buffer
+            Some(ActiveJob::Streaming {
+                direction: StreamDirection::In,
+            })
+            | Some(ActiveJob::Loopback) => {
+                // Read from the stream-in / loopback ring buffer
                 if let Some(ref rb) = st.stream_in_buffer {
-                    let n_floats = n_frames * channels as usize;
-                    let mut temp = vec![0.0f32; n_floats];
+                    let n_samples = n_frames * channels;
+                    let mut temp = vec![0.0f32; n_samples];
                     let read = rb.read(&mut temp);
-                    for i in 0..n_floats {
-                        let val = if i < read { temp[i] } else { 0.0 };
-                        let start = i * CHAN_SIZE;
-                        let end = start + CHAN_SIZE;
-                        if end <= slice.len() {
-                            slice[start..end].copy_from_slice(&f32::to_le_bytes(val));
+                    // Underrun pads with silence rather than replaying stale
+                    // ring contents.
+                    temp[read..].fill(0.0);
+                    for (i, &val) in temp.iter().enumerate() {
+                        let start = i * bps;
+                        if start + bps <= slice.len() {
+                            write_sample(&mut slice[start..start + bps], val, sample_fmt);
                         }
                     }
                 } else {
@@ -481,6 +630,24 @@ fn source_process(stream: &StreamRef, state: &Rc<RefCell<SourceState>>, channels
     *chunk.size_mut() = (stride * n_frames) as _;
 }
 
+#[inline]
+fn fill_silence(
+    slice: &mut [u8],
+    from_frame: usize,
+    n_frames: usize,
+    channels: usize,
+    stride: usize,
+    bps: usize,
+    fmt: SampleFormat,
+) {
+    for j in from_frame..n_frames {
+        for c in 0..channels {
+            let s = j * stride + c * bps;
+            write_sample(&mut slice[s..s + bps], 0.0, fmt);
+        }
+    }
+}
+
 fn sink_process(stream: &StreamRef, state: &Rc<RefCell<SinkState>>) {
     let mut buffer = match stream.dequeue_buffer() {
         Some(b) => b,
@@ -495,6 +662,13 @@ fn sink_process(stream: &StreamRef, state: &Rc<RefCell<SinkState>>) {
     let data = &mut datas[0];
     // Read chunk size before taking the mutable slice reference
     let chunk_size = data.chunk().size() as usize;
+
+    let sample_fmt = match state.try_borrow() {
+        Ok(st) => st.format.sample_format,
+        Err(_) => return,
+    };
+    let bps = sample_fmt.bytes_per_sample();
+
     if let Some(slice) = data.data() {
         // Use try_borrow_mut to avoid panicking if a command handler
         // currently holds the borrow (timer + process callback can overlap).
@@ -504,18 +678,18 @@ fn sink_process(stream: &StreamRef, state: &Rc<RefCell<SinkState>>) {
         };
         if st.active_job.is_some() {
             // Use the actual data size from the chunk, not the full buffer capacity
-            let n_floats = if chunk_size > 0 {
-                chunk_size / CHAN_SIZE
+            let n_samples = if chunk_size > 0 {
+                chunk_size / bps
             } else {
-                slice.len() / CHAN_SIZE
+                slice.len() / bps
             };
-            let mut samples = Vec::with_capacity(n_floats);
-            for i in 0..n_floats {
-                let start = i * CHAN_SIZE;
-                let end = start + CHAN_SIZE;
-                let val =
-                    f32::from_le_bytes(slice[start..end].try_into().unwrap_or([0; 4]));
-                samples.push(val);
+            let mut samples = Vec::with_capacity(n_samples);
+            for i in 0..n_samples {
+                let start = i * bps;
+                if start + bps > slice.len() {
+                    break;
+                }
+                samples.push(read_sample(&slice[start..start + bps], sample_fmt));
             }
 
             // Write to stream-out ring buffer if streaming
@@ -523,22 +697,32 @@ fn sink_process(stream: &StreamRef, state: &Rc<RefCell<SinkState>>) {
                 rb.write(&samples);
             }
 
-            // Also accumulate in record buffer if recording
-            if st.record_file_path.is_some() {
-                st.record_buffer.extend_from_slice(&samples);
+            // Feed the source when looping back
+            if let Some(ref rb) = st.loopback_buffer {
+                rb.write(&samples);
+            }
+
+            // Hand recorded audio to the writer thread
+            if st.recorder.is_some() && !st.record_complete {
+                let remaining = match st.record_limit_samples {
+                    Some(limit) => limit.saturating_sub(st.record_samples) as usize,
+                    None => samples.len(),
+                };
+                let take = remaining.min(samples.len());
+                if take > 0 {
+                    if let Some(ref rec) = st.recorder {
+                        rec.push(&samples[..take]);
+                    }
+                    st.record_samples += take as u64;
+                }
+                if let Some(limit) = st.record_limit_samples
+                    && st.record_samples >= limit
+                {
+                    // Finalized by DevicePair::poll off the RT thread.
+                    st.record_complete = true;
+                }
             }
         }
-    }
-}
-
-fn flush_recording(buffer: &[f32], path: &str, format: &AudioFormat) {
-    if buffer.is_empty() {
-        return;
-    }
-    if let Err(e) = crate::audio::encoder::write_wav(buffer, path, format) {
-        tracing::error!("Failed to write recording to {path}: {e}");
-    } else {
-        tracing::info!("Wrote recording to {path}");
     }
 }
 
@@ -555,4 +739,31 @@ fn fastrand_f64() -> f64 {
         s.set(x);
         (x as f64) / (u64::MAX as f64)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sample_roundtrip_preserves_value() {
+        for fmt in [SampleFormat::F32LE, SampleFormat::S16LE, SampleFormat::S32LE] {
+            let mut buf = vec![0u8; fmt.bytes_per_sample()];
+            for v in [0.0f32, 0.5, -0.5, 1.0, -1.0] {
+                write_sample(&mut buf, v, fmt);
+                let got = read_sample(&buf, fmt);
+                assert!(
+                    (got - v).abs() < 0.001,
+                    "{fmt}: wrote {v}, read back {got}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn stride_follows_sample_format() {
+        assert_eq!(SampleFormat::S16LE.bytes_per_sample(), 2);
+        assert_eq!(SampleFormat::S32LE.bytes_per_sample(), 4);
+        assert_eq!(SampleFormat::F32LE.bytes_per_sample(), 4);
+    }
 }

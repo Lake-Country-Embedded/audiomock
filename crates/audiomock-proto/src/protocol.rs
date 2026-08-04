@@ -18,6 +18,8 @@ pub enum Request {
         name: String,
         source_description: Option<String>,
         sink_description: Option<String>,
+        #[serde(default)]
+        autoconnect: bool,
     },
 
     /// Destroy a device pair.
@@ -60,6 +62,23 @@ pub enum Request {
         sample_format: SampleFormat,
     },
 
+    /// Route a device's sink back into its own source.
+    Loopback { device: String },
+
+    /// Link a device pair to PipeWire nodes matching a pattern.
+    Link {
+        device: String,
+        /// Node name pattern to match; defaults to "qemu" when omitted.
+        pattern: Option<String>,
+        /// Drop links that other clients (typically the session manager) made
+        /// to this pair before adding ours.
+        #[serde(default)]
+        exclusive: bool,
+    },
+
+    /// Remove every link touching a device pair.
+    Unlink { device: String },
+
     /// Stop any active job on a device.
     Stop { device: String },
 }
@@ -95,6 +114,16 @@ pub enum Response {
 
     /// Streaming started, includes the data socket path.
     StreamStarted { data_socket: String },
+
+    /// Loopback started.
+    LoopbackStarted { device: String },
+
+    /// Links created or removed.
+    Linked {
+        device: String,
+        created: usize,
+        removed: usize,
+    },
 
     /// Job stopped.
     Stopped { device: String },

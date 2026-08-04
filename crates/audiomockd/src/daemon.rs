@@ -14,6 +14,17 @@ pub struct DaemonState {
     pub pw_handle: pw_backend::PipewireHandle,
 }
 
+impl DaemonState {
+    /// Default pattern for `link` when the caller does not name one.
+    pub fn default_link_pattern(&self) -> String {
+        self.config
+            .device_pairs
+            .iter()
+            .find_map(|d| d.auto_link_pattern.clone())
+            .unwrap_or_else(|| "qemu".to_string())
+    }
+}
+
 pub async fn run(config: DaemonConfig) -> Result<()> {
     let socket_path = config.socket_path();
 

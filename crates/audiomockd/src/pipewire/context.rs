@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 use anyhow::Result;
-use audiomock_proto::audio::{AudioFormat, SampleFormat};
+use audiomock_proto::audio::AudioFormat;
 use audiomock_proto::config::{AudioSection, DevicePairConfig};
 use audiomock_proto::device::DeviceInfo;
 use crossbeam_channel::Receiver;
@@ -16,6 +16,11 @@ pub fn run_pipewire_loop(
     initial_devices: Vec<DevicePairConfig>,
     audio_config: AudioSection,
 ) -> Result<()> {
+    // Validate the configured format up front rather than silently defaulting.
+    let format = audio_config
+        .format()
+        .map_err(|e| anyhow::anyhow!("Invalid [audio] config: {e}"))?;
+
     pw::init();
 
     let mainloop = pw::main_loop::MainLoop::new(None)?;
@@ -35,16 +40,32 @@ pub fn run_pipewire_loop(
             .clone()
             .unwrap_or_else(|| format!("{} Sink", dev_config.name));
 
-        let format = AudioFormat {
-            sample_rate: audio_config.default_sample_rate,
-            channels: audio_config.default_channels,
-            sample_format: SampleFormat::F32LE,
-        };
-
-        match DevicePair::new(&core, &dev_config.name, &source_desc, &sink_desc, &format) {
+        match DevicePair::new(
+            &core,
+            &dev_config.name,
+            &source_desc,
+            &sink_desc,
+            &format,
+            dev_config.autoconnect,
+            audio_config.buffer_size,
+        ) {
             Ok(pair) => {
                 tracing::info!("Created device pair: {}", dev_config.name);
                 devices.borrow_mut().insert(dev_config.name.clone(), pair);
+                if let Some(ref pattern) = dev_config.auto_link_pattern {
+                    match crate::linker::link_device(&dev_config.name, pattern, true) {
+                        Ok(r) => tracing::info!(
+                            "auto_link_pattern '{pattern}' on '{}': {} link(s) created, {} removed",
+                            dev_config.name,
+                            r.created,
+                            r.removed
+                        ),
+                        Err(e) => tracing::warn!(
+                            "auto_link_pattern '{pattern}' on '{}' failed: {e}",
+                            dev_config.name
+                        ),
+                    }
+                }
             }
             Err(e) => {
                 tracing::error!("Failed to create device pair '{}': {e}", dev_config.name);
@@ -65,6 +86,11 @@ pub fn run_pipewire_loop(
             // Each command borrows and releases devices within its own scope.
             while let Ok(cmd) = cmd_rx.try_recv() {
                 process_command(cmd, &devices, &core, &audio_config, &mainloop_weak);
+            }
+            // Finish anything the real-time callbacks flagged, such as a
+            // duration-limited recording reaching its budget.
+            for dev in devices.borrow_mut().values_mut() {
+                dev.poll();
             }
         }
     });
@@ -103,16 +129,19 @@ fn process_command(
             name,
             source_description,
             sink_description,
+            autoconnect,
             reply,
         } => {
             if devices.borrow().contains_key(&name) {
                 let _ = reply.send(Err(format!("Device '{name}' already exists")));
                 return;
             }
-            let format = AudioFormat {
-                sample_rate: audio_config.default_sample_rate,
-                channels: audio_config.default_channels,
-                sample_format: SampleFormat::F32LE,
+            let format: AudioFormat = match audio_config.format() {
+                Ok(f) => f,
+                Err(e) => {
+                    let _ = reply.send(Err(format!("Invalid audio config: {e}")));
+                    return;
+                }
             };
             match DevicePair::new(
                 core,
@@ -120,6 +149,8 @@ fn process_command(
                 &source_description,
                 &sink_description,
                 &format,
+                autoconnect,
+                audio_config.buffer_size,
             ) {
                 Ok(pair) => {
                     tracing::info!("Created device pair: {name}");
@@ -188,14 +219,34 @@ fn process_command(
         PwCommand::StartRecord {
             device,
             file_path,
+            out_format,
+            duration_secs,
+            sample_rate,
+            channels,
             reply,
         } => {
             let mut devs = devices.borrow_mut();
             if let Some(dev) = devs.get_mut(&device) {
-                match dev.start_recording(&file_path) {
+                match dev.start_recording(
+                    &file_path,
+                    out_format,
+                    duration_secs,
+                    sample_rate,
+                    channels,
+                ) {
                     Ok(()) => { let _ = reply.send(Ok(())); }
                     Err(e) => { let _ = reply.send(Err(e.to_string())); }
                 }
+            } else {
+                let _ = reply.send(Err(format!("Device '{device}' not found")));
+            }
+        }
+
+        PwCommand::StartLoopback { device, reply } => {
+            let mut devs = devices.borrow_mut();
+            if let Some(dev) = devs.get_mut(&device) {
+                dev.start_loopback();
+                let _ = reply.send(Ok(()));
             } else {
                 let _ = reply.send(Err(format!("Device '{device}' not found")));
             }

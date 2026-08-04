@@ -1,6 +1,7 @@
 pub mod devices;
 pub mod generate;
 pub mod link;
+pub mod loopback;
 pub mod play;
 pub mod record;
 pub mod status;

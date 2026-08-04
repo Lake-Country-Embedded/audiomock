@@ -26,6 +26,21 @@ impl std::fmt::Display for SampleFormat {
     }
 }
 
+impl std::str::FromStr for SampleFormat {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_uppercase().as_str() {
+            "S16LE" => Ok(SampleFormat::S16LE),
+            "S32LE" => Ok(SampleFormat::S32LE),
+            "F32LE" => Ok(SampleFormat::F32LE),
+            other => Err(format!(
+                "unknown sample format '{other}' (expected S16LE, S32LE or F32LE)"
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct AudioFormat {
     pub sample_rate: u32,

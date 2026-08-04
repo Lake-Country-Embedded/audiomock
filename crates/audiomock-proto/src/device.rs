@@ -29,6 +29,9 @@ pub enum ActiveJob {
     Streaming {
         direction: StreamDirection,
     },
+    /// Sink audio routed back into the source inside the daemon, so a guest
+    /// hears its own output without creating a cycle in the PipeWire graph.
+    Loopback,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
