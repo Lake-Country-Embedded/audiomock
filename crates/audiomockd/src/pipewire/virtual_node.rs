@@ -317,6 +317,12 @@ fn source_process(stream: &StreamRef, state: &Rc<RefCell<SourceState>>, channels
         None => return,
     };
 
+    // How many frames the graph actually wants this cycle. The mapped buffer
+    // is far larger than one quantum, so filling all of it makes the node
+    // produce long bursts at long intervals instead of a steady stream. That
+    // is inaudible for a continuous tone but wrecks anything rate-coupled.
+    let requested = buffer.requested() as usize;
+
     let datas = buffer.datas_mut();
     if datas.is_empty() {
         return;
@@ -326,7 +332,12 @@ fn source_process(stream: &StreamRef, state: &Rc<RefCell<SourceState>>, channels
     let stride = CHAN_SIZE * channels as usize;
 
     let n_frames = if let Some(slice) = data.data() {
-        let n_frames = slice.len() / stride;
+        let capacity_frames = slice.len() / stride;
+        let n_frames = if requested > 0 {
+            requested.min(capacity_frames)
+        } else {
+            capacity_frames
+        };
         // Use try_borrow_mut to avoid panicking if a command handler
         // currently holds the borrow (timer + process callback can overlap).
         let mut st = match state.try_borrow_mut() {

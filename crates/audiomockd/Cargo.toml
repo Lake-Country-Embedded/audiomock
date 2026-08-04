@@ -18,7 +18,9 @@ tracing-subscriber = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
 crossbeam-channel = "0.5"
-pipewire = "0.8"
+# v0_3_49 exposes pw_buffer::requested, needed to fill exactly the quantum the
+# graph asks for rather than the whole mapped buffer.
+pipewire = { version = "0.8", features = ["v0_3_49"] }
 libspa = "0.8"
 gstreamer = "0.23"
 gstreamer-audio = "0.23"
