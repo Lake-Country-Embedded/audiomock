@@ -80,10 +80,29 @@ qemu-system-aarch64 \
 Link QEMU to the virtual devices:
 
 ```bash
-audiomock link --device default
+audiomock link --device default --exclusive
 ```
 
+`--exclusive` first drops any links the session manager made to this pair.
+Without it, WirePlumber's default routing can leave a real microphone attached
+to the sink, quietly mixing room noise into every capture.
+
 Then generate/record/play as needed. Inside the VM, audio appears on standard ALSA devices.
+
+### Telling several VMs apart
+
+QEMU names every instance's PipeWire streams `qemu-system-aarch64`, so with more
+than one VM running, a name match cannot tell them apart. `out.stream-name` only
+sets `media.name`, which `pw-link` does not key on. Override the node name per
+VM instead:
+
+```bash
+PIPEWIRE_PROPS='{ node.name = vkdut-myvm }' qemu-system-aarch64 ...
+audiomock link --device default --qemu-node vkdut-myvm --exclusive
+```
+
+In this repo `vkdev dut start <nickname>` does this automatically, naming each
+DUT's node `vkdut-<nickname>`.
 
 ## CLI reference
 
@@ -92,13 +111,32 @@ audiomock status                          Show daemon info and active jobs
 audiomock devices list|create|destroy     Manage virtual device pairs
 audiomock generate [--frequency Hz]       Generate test tones (sine/square/sawtooth/noise)
 audiomock play <file>                     Play WAV/MP3/FLAC/OGG to virtual source
-audiomock record <file> [--duration s]    Record from virtual sink
+audiomock record <file> [--duration s]    Record from virtual sink (WAV/FLAC/OGG)
 audiomock stream --direction in|out       Raw PCM streaming via stdin/stdout
-audiomock link                            Link QEMU PipeWire nodes to virtual devices
+audiomock link [--exclusive]              Link peer PipeWire nodes to virtual devices
+audiomock unlink                          Remove every link touching a device pair
+audiomock loopback                        Route a device's sink back into its source
 audiomock stop --device <name>            Stop active job on a device
 ```
 
-All commands accept `--device <name>` (default: `default`) and `--json` for machine-readable output.
+All commands accept `--device <name>` (default: `default`). `--json` and
+`--socket` are global and may be given before or after the subcommand.
+
+Recording is owned by the daemon: `--duration` stops and finalizes the file
+server-side, so killing the CLI mid-capture still leaves a complete WAV.
+`--sample-rate` and `--channels` resample and remix on the way out.
+
+### Loopback
+
+`loopback` routes a device pair's sink back into its own source inside the
+daemon. Use it to make a guest hear its own speaker output, for example when
+exercising an acoustic mic/speaker self-test.
+
+Do not link a QEMU node's output port straight to its own input port to achieve
+this. Both ports belong to one process, so PipeWire treats it as a scheduling
+cycle: the link appears in `pw-link -l` and both nodes report `running`, but
+that node is fed silence from every source, not just the loop. Routing through
+the daemon keeps the two peer nodes unlinked and avoids the cycle entirely.
 
 ## Configuration
 
@@ -132,7 +170,11 @@ audiomock devices create my-device --source-description "My Mic" --sink-descript
 cargo test --workspace -- --test-threads=1
 ```
 
-24 tests: protocol serialization, ring buffer, and integration tests that start the daemon, exercise all commands, and validate audio with GStreamer frequency analysis.
+38 tests: protocol serialization, ring buffer, sample-format conversion, link
+listing, recorder finalization, and integration tests that start the daemon and
+exercise every command.
+
+Integration tests need a running PipeWire session.
 
 ## Architecture
 

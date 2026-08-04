@@ -5,11 +5,20 @@ log_level = "info"
 [audio]
 default_sample_rate = 48000
 default_channels = 2
+# S16LE, S32LE or F32LE. An unrecognized value is rejected at startup rather
+# than silently ignored.
 default_sample_format = "F32LE"
+# Requested quantum in frames, published as node.latency = buffer_size/rate.
 buffer_size = 1024
 
 [[device_pairs]]
 name = "qemu-audio-0"
 source_description = "QEMU Virtual Mic 0"
 sink_description = "QEMU Virtual Speaker 0"
-# auto_link_pattern = "QEMU"
+# Let the session manager pick a target for these streams. Off by default so a
+# test rig only carries links it asked for; WirePlumber will otherwise staple
+# whatever microphone it considers the default onto the sink.
+autoconnect = false
+# Link to peer nodes matching this pattern as soon as the pair is created.
+# Uses the same matching as `audiomock link --exclusive`.
+# auto_link_pattern = "vkdut-pb3vkz01"
