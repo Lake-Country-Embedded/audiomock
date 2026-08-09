@@ -1,0 +1,12 @@
+pyproject.toml
+audiomock/__init__.py
+audiomock/client.py
+audiomock/protocol.py
+audiomock/pytest_plugin.py
+audiomock/results.py
+audiomock/selftest.py
+audiomock.egg-info/PKG-INFO
+audiomock.egg-info/SOURCES.txt
+audiomock.egg-info/dependency_links.txt
+audiomock.egg-info/entry_points.txt
+audiomock.egg-info/top_level.txt

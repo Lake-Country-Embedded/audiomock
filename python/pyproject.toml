@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "audiomock"
+version = "0.1.0"
+description = "Python bindings and pytest fixtures for the audiomock virtual audio daemon"
+requires-python = ">=3.9"
+dependencies = []
+
+[project.entry-points.pytest11]
+audiomock = "audiomock.pytest_plugin"
+
+[project.scripts]
+audiomock-selftest = "audiomock.selftest:main"
+
+[tool.setuptools.packages.find]
+include = ["audiomock*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "e2e: end-to-end tests that need a running audiomockd",
+]

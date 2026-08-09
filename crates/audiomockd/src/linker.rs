@@ -94,6 +94,54 @@ fn touches_device(link: &Link, device: &str) -> bool {
         .any(|p| p.starts_with(&src) || p.starts_with(&snk))
 }
 
+/// Remove links between the given peer ports and anything that is not ours.
+///
+/// [`unlink_device`] only drops links that touch *our* nodes, so a session
+/// manager's auto-routing on the peer survives it: the host microphone keeps
+/// feeding the guest's mic input, and the guest's speaker output keeps reaching
+/// real hardware. On the capture side that is merely noisy, because PipeWire
+/// fans the guest's output out to both destinations. On the **injection** side
+/// it is a correctness problem -- the host mic mixes into the guest's mic
+/// alongside whatever the test is injecting, so a test measuring an injected
+/// tone is really measuring that tone plus the room.
+///
+/// Links to our own pair are left alone so this is safe to call after linking.
+fn unlink_foreign(ports: &[&String], device: &str) -> Result<usize> {
+    let (src, snk) = (source_node(device), sink_node(device));
+    let mut removed = 0usize;
+    for link in list_links()? {
+        let touches_peer = ports
+            .iter()
+            .any(|p| ***p == link.output || ***p == link.input);
+        if !touches_peer {
+            continue;
+        }
+        let is_ours = [&link.output, &link.input]
+            .iter()
+            .any(|p| p.starts_with(&src) || p.starts_with(&snk));
+        if is_ours {
+            continue;
+        }
+        let status = run_pw_link(&["-d", &link.output, &link.input])?;
+        if status.status.success() {
+            tracing::info!(
+                "Exclusive: dropped foreign link {} -> {}",
+                link.output,
+                link.input
+            );
+            removed += 1;
+        } else {
+            tracing::warn!(
+                "Exclusive: failed to drop {} -> {}: {}",
+                link.output,
+                link.input,
+                String::from_utf8_lossy(&status.stderr).trim()
+            );
+        }
+    }
+    Ok(removed)
+}
+
 /// Remove every link touching this device pair, whoever created it.
 pub fn unlink_device(device: &str) -> Result<LinkReport> {
     let mut report = LinkReport::default();
@@ -116,8 +164,13 @@ pub fn unlink_device(device: &str) -> Result<LinkReport> {
 /// Link a device pair to nodes whose port names match `pattern`.
 ///
 /// Guest speaker output lands on our sink; our source feeds the guest mic.
-/// When `exclusive` is set, pre-existing links on our pair are dropped first,
-/// which is what keeps a session manager's auto-routing out of a test capture.
+///
+/// When `exclusive` is set this drops pre-existing links on **both** sides:
+/// ours, so re-linking is idempotent, and the matched peer's, so a session
+/// manager's auto-routing does not survive alongside us. Only clearing our own
+/// side is not enough -- the auto-routing links never touch our ports, so they
+/// used to be left in place, leaving the host microphone wired into the guest's
+/// mic input next to whatever a test was injecting.
 pub fn link_device(device: &str, pattern: &str, exclusive: bool) -> Result<LinkReport> {
     let mut report = if exclusive {
         unlink_device(device)?
@@ -150,6 +203,16 @@ pub fn link_device(device: &str, pattern: &str, exclusive: bool) -> Result<LinkR
 
     if peer_outputs.is_empty() && peer_inputs.is_empty() {
         anyhow::bail!("No PipeWire nodes matched pattern '{pattern}'");
+    }
+
+    // Exclusivity has to cover the *peer's* existing routing too, not just
+    // ours. Done after the peer ports are known and before our own links are
+    // made, so nothing we just created is torn down again.
+    if exclusive {
+        let mut peers: Vec<&String> = Vec::new();
+        peers.extend(peer_outputs.iter().copied());
+        peers.extend(peer_inputs.iter().copied());
+        report.removed += unlink_foreign(&peers, device)?;
     }
 
     if our_sink_inputs.len() != peer_outputs.len() && !peer_outputs.is_empty() {

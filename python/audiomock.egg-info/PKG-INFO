@@ -1,0 +1,5 @@
+Metadata-Version: 2.4
+Name: audiomock
+Version: 0.1.0
+Summary: Python bindings and pytest fixtures for the audiomock virtual audio daemon
+Requires-Python: >=3.9
