@@ -3,3 +3,9 @@ Cargo.lock
 *.swp
 *.swo
 *~
+
+# Python build artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/

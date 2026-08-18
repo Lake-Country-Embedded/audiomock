@@ -1,5 +1,0 @@
-[console_scripts]
-audiomock-selftest = audiomock.selftest:main
-
-[pytest11]
-audiomock = audiomock.pytest_plugin
