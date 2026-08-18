@@ -171,6 +171,61 @@ class AudioMock:
 
     # -- injection ---------------------------------------------------------
 
+    def _guard_idle(self, device: Optional[str], what: str, on_busy: str) -> None:
+        """Refuse, or clear, a *conflicting* job already running on the device.
+
+        Starting a job while another is active silently replaces it, which is
+        how a leaked ``play --loop-count 0`` can feed a DUT indefinitely without
+        anything noticing: the leak is invisible to whoever starts the next job,
+        and every later capture is contaminated. So make it impossible to start
+        one without dealing with the existing job.
+
+        Only jobs in the *same direction* conflict. Playback feeds the DUT's
+        mic/line-in; ``Recording`` captures the DUT's speaker/line-out. They run
+        on independent nodes, and capturing while injecting is the core pattern
+        of every audio test here::
+
+            with dut_audio_capture(seconds=6) as capture:
+                inject("sustained")
+
+        Treating a live ``Recording`` as a conflict would stop the capture the
+        instant the tone started, and the test would then measure silence and
+        report it as the DUT being silent. Anything that is not a ``Recording``
+        is treated as conflicting, so an unrecognised future job kind still
+        errs on the safe side.
+
+        ``on_busy="stop"`` (default) stops the old job and logs it, keeping test
+        runs deterministic while still surfacing the leak. ``on_busy="fail"``
+        raises instead, for callers that would rather not paper over it.
+        """
+        if on_busy not in ("stop", "fail"):
+            raise ValueError(f"on_busy must be 'stop' or 'fail', got {on_busy!r}")
+
+        name = self._device(device)
+        busy = next(
+            (
+                d
+                for d in self.devices()
+                if d.name == name
+                and d.busy
+                and not (d.active_job is not None and d.active_job.kind == "Recording")
+            ),
+            None,
+        )
+        if busy is None:
+            return
+
+        kind = busy.active_job.kind if busy.active_job else "unknown"
+        message = (
+            f"audiomock device {name!r} already had a {kind} job running when "
+            f"{what} was requested; it was almost certainly leaked by an earlier "
+            f"run (a looping play outlives the process that started it)"
+        )
+        if on_busy == "fail":
+            raise AudioMockError(message)
+        logger.warning("%s -- stopping it first", message)
+        self.stop(device=name)
+
     def play(
         self,
         file_path: PathLike,
@@ -178,13 +233,17 @@ class AudioMock:
         device: Optional[str] = None,
         loop_count: Optional[int] = None,
         volume: float = 1.0,
+        on_busy: str = "stop",
     ) -> None:
         """Play a file into the DUT's microphone/line-in.
 
         ``loop_count=0`` loops forever. Returns as soon as playback starts --
         the daemon sends no completion event, so a caller that needs the file to
         finish must wait for its known duration.
+
+        Refuses to start on top of an existing job; see :meth:`_guard_idle`.
         """
+        self._guard_idle(device, "play", on_busy)
         self._call({
             "type": "Play",
             "device": self._device(device),
@@ -201,11 +260,15 @@ class AudioMock:
         frequency: float = 440.0,
         volume: float = 1.0,
         duration_secs: Optional[float] = None,
+        on_busy: str = "stop",
     ) -> None:
         """Generate a tone into the DUT's microphone/line-in.
 
-        With no ``duration_secs`` the tone runs until :meth:`stop`.
+        With no ``duration_secs`` the tone runs until :meth:`stop`, so this is
+        the other way to leak a permanent signal into a DUT. Guarded the same
+        way as :meth:`play`.
         """
+        self._guard_idle(device, "generate", on_busy)
         self._call({
             "type": "Generate",
             "device": self._device(device),

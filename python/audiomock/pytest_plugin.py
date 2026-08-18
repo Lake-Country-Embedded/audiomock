@@ -13,6 +13,7 @@ it explicitly when the emulator was started under a different nickname.
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Iterator, Optional
 
@@ -112,6 +113,22 @@ def dut_audio(audiomock_daemon, audiomock_node_name) -> Iterator[AudioMock]:
 
     try:
         client.link(node_pattern=audiomock_node_name, exclusive=True, require=True)
+
+        # A job still running here was leaked by an earlier run or another
+        # session, and would feed this DUT for the whole session: every
+        # silence assertion would be meaningless and every capture polluted.
+        # Clear it at the door rather than letting each test discover it.
+        stale = next(
+            (d for d in client.devices() if d.name == device and d.busy), None
+        )
+        if stale is not None:
+            kind = stale.active_job.kind if stale.active_job else "unknown"
+            logging.getLogger(__name__).warning(
+                "audiomock device %r had a leaked %s job at session start; "
+                "stopping it before any test runs", device, kind,
+            )
+            client.stop()
+
         yield client
     finally:
         try:
