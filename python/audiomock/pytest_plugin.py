@@ -14,6 +14,7 @@ it explicitly when the emulator was started under a different nickname.
 from __future__ import annotations
 
 import logging
+import subprocess
 from pathlib import Path
 from typing import Iterator, Optional
 
@@ -102,14 +103,65 @@ def audiomock_node_name(request) -> str:
     return nickname if nickname.startswith("vkdut-") else f"vkdut-{nickname}"
 
 
+def _assert_no_physical_audio(node_name: str) -> None:
+    """Fail if the DUT is wired to real hardware.
+
+    Linking non-exclusively is only safe because `vkdev dut start` points the
+    emulator at private null endpoints. Started by an older vkdev (or by hand
+    without them), the DUT lands on the host's default sink and source instead:
+    the developer's microphone feeds the device under test, so room noise sits
+    inside every input-level and silence assertion, and the device plays out of
+    their speakers. That is a wrong answer, not a flaky one, so refuse rather
+    than measure it.
+    """
+    try:
+        out = subprocess.run(["pw-link", "-l"], capture_output=True, text=True,
+                             timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return  # no pw-link: nothing to check against, carry on
+    if out.returncode != 0:
+        return
+
+    physical, seen_dut = [], False
+    for line in out.stdout.splitlines():
+        stripped = line.strip()
+        if not line.startswith((" ", "\t")):
+            seen_dut = stripped.startswith(f"{node_name}:")
+            continue
+        peer = stripped.lstrip("|<->").strip()
+        if seen_dut and peer.startswith("alsa_"):
+            physical.append(peer)
+
+    if physical:
+        pytest.fail(
+            f"{node_name} is linked to physical audio hardware "
+            f"({', '.join(sorted(set(physical)))}). The DUT must run on its own "
+            f"null endpoints: restart it with `vkdev dut stop/start`, which "
+            f"creates them. Measuring through the host's speakers and "
+            f"microphone would mix room noise into every capture."
+        )
+
+
 @pytest.fixture(scope="session")
 def dut_audio(audiomock_daemon, audiomock_node_name) -> Iterator[AudioMock]:
-    """A device pair exclusively linked to the DUT's emulated audio device.
+    """A device pair linked alongside the DUT's private null endpoints.
 
     Creates a pair named after the DUT node so concurrent DUTs do not collide,
-    links it exclusively -- otherwise WirePlumber routes the DUT to real
-    speakers and a real microphone, silently mixing room noise into every
-    capture -- and unlinks and destroys it afterwards.
+    links it, and unlinks and destroys it afterwards.
+
+    The link is deliberately **not** exclusive. It used to be, to stop
+    WirePlumber routing the DUT to real speakers and a real microphone; that
+    job now belongs to `vkdev dut start`, which gives each emulator its own
+    null sink and virtual source and names them as QEMU's targets, so no
+    physical device is ever in the path.
+
+    Exclusivity actively broke things once that was in place. It tore down the
+    null-endpoint links, and `unlink()` at session teardown left the emulator's
+    output stream connected to nothing at all. QEMU drives AC97 DMA from its
+    backend's process callback, so an unconsumed output stream stops the DMA:
+    the guest's `hw_ptr` never leaves 0, writes fail with EIO, and every later
+    capture is well-formed digital silence at -96 dBFS. The DUT stayed that way
+    until it was restarted, so one session poisoned the next.
 
     Fails rather than skips when the link cannot be made: a linked-looking but
     unlinked pair still produces valid all-zero recordings, and a test that
@@ -128,7 +180,8 @@ def dut_audio(audiomock_daemon, audiomock_node_name) -> Iterator[AudioMock]:
         )
 
     try:
-        client.link(node_pattern=audiomock_node_name, exclusive=True, require=True)
+        client.link(node_pattern=audiomock_node_name, exclusive=False, require=True)
+        _assert_no_physical_audio(audiomock_node_name)
 
         # A job still running here was leaked by an earlier run or another
         # session, and would feed this DUT for the whole session: every
