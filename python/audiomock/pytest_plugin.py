@@ -50,17 +50,30 @@ def audiomock_socket(request) -> Path:
 
 @pytest.fixture(scope="session")
 def audiomock_daemon(audiomock_socket) -> AudioMock:
-    """A reachable audiomockd, or skip.
+    """A reachable audiomockd.
 
-    Skips rather than fails: audiomock is QEMU-only by construction (it links
-    host PipeWire nodes, and real hardware exposes none), so its absence is a
-    property of the environment, not a defect.
+    Fails rather than skips. A test that asks for this fixture has declared it
+    needs injected or captured audio; if the daemon is gone that test is not
+    "inapplicable here", it is unverified. Skipping made a dead daemon look like
+    a clean run: audiomockd exited mid-session once and twenty line-in tests
+    skipped while the suite still reported green, which is exactly the silent
+    coverage loss these tests exist to prevent.
+
+    Selection is the job of the ``requires_audiomock`` marker and the capability
+    gates, not of this fixture. Deselect on a target that cannot run audiomock;
+    do not let an absent daemon quietly excuse the tests.
     """
     client = AudioMock(audiomock_socket)
     try:
         status = client.status()
     except DaemonUnavailable as exc:
-        pytest.skip(str(exc))
+        pytest.fail(
+            f"{exc}\n"
+            f"These tests require audiomock; a missing daemon is a broken rig, "
+            f"not a reason to pass. Start it with `audiomockd` (or "
+            f"`systemctl --user start audiomockd` where the unit is installed), "
+            f"or deselect the audiomock tests with -m 'not requires_audiomock'."
+        )
     except AudioMockError as exc:
         pytest.fail(f"audiomockd is reachable but unhealthy: {exc}")
 
@@ -78,7 +91,10 @@ def audiomock_node_name(request) -> str:
 
     host = request.config.getoption("--host", default=None)
     if not host:
-        pytest.skip("cannot infer the DUT's PipeWire node; pass --audiomock-node")
+        pytest.fail(
+            "cannot infer the DUT's PipeWire node: pass --audiomock-node "
+            "(or --host). Skipping here would hide the tests rather than run them."
+        )
 
     # vkdev names the emulator's node vkdut-<nickname>, where the nickname is
     # the host without its mDNS suffix.
