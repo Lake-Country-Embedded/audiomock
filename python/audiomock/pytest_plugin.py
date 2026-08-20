@@ -180,6 +180,16 @@ def dut_audio(audiomock_daemon, audiomock_node_name) -> Iterator[AudioMock]:
         )
 
     try:
+        # Drop our own stale links first. `link()` reports how many it
+        # *created*, and connect() is a no-op on a link that already exists, so
+        # a pair left behind by an earlier session reports created=0 and
+        # require=True raises even though the DUT is correctly wired.
+        # Exclusive mode never hit this because it cleared our side first; this
+        # keeps that half without also tearing down the DUT's null endpoints.
+        try:
+            client.unlink()
+        except AudioMockError:
+            pass
         client.link(node_pattern=audiomock_node_name, exclusive=False, require=True)
         _assert_no_physical_audio(audiomock_node_name)
 
