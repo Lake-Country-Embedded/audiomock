@@ -11,7 +11,7 @@ pub fn decode_file(path: &str, target: &AudioFormat) -> Result<Vec<f32>> {
     let pipeline_str = format!(
         "filesrc location={path} ! decodebin ! audioconvert ! audioresample ! \
          audio/x-raw,format=F32LE,rate={rate},channels={ch},layout=interleaved ! \
-         appsink name=sink",
+         appsink name=sink sync=false",
         path = shell_escape(path),
         rate = target.sample_rate,
         ch = target.channels,
