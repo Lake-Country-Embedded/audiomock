@@ -74,9 +74,9 @@ pub fn run_pipewire_loop(
     }
 
     // Set up a timer to poll for commands from the IPC layer.
-    // IMPORTANT: Each command must borrow and DROP the RefCell before the next
-    // command, so that PipeWire process callbacks (which also borrow the state)
-    // don't hit a double-borrow panic.
+    // Commands run here on the main loop. The device map stays on this thread;
+    // per-node state is shared with the real-time process callbacks through a
+    // Mutex they only try_lock (see virtual_node.rs).
     let timer = mainloop.loop_().add_timer({
         let mainloop_weak = mainloop.downgrade();
         let core = core.clone();
@@ -109,8 +109,8 @@ pub fn run_pipewire_loop(
     Ok(())
 }
 
-/// Process a single command. Borrows are scoped tightly to avoid conflicts
-/// with PipeWire process callbacks that run on the same thread.
+/// Process a single command. Node-state locks are held briefly so the
+/// real-time process callbacks rarely skip a cycle.
 fn process_command(
     cmd: PwCommand,
     devices: &RefCell<HashMap<String, DevicePair>>,

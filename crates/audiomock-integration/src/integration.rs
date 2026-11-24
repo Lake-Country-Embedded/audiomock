@@ -664,6 +664,46 @@ async fn test_recording() -> Result<()> {
     Ok(())
 }
 
+/// Stop must not race the real-time process callbacks. The streams run with
+/// RT_PROCESS, so a Stop that lands while a callback holds the node state used
+/// to panic ("RefCell already borrowed") and abort the daemon. The collision
+/// is a timing window, so hammer it: this loop killed the old daemon in 3 of
+/// 4 runs, so a pass is strong evidence, not proof.
+#[tokio::test]
+async fn test_stop_races_running_jobs() -> Result<()> {
+    let (mut guard, socket) = setup_daemon("stop-race").await?;
+    let dir = tempfile::tempdir()?;
+    let rec = dir.path().join("race.wav").to_str().unwrap().to_string();
+    let device = || "default".to_string();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    for cycle in 0..1000 {
+        let requests = [
+            Request::Loopback { device: device() },
+            Request::Stop { device: device() },
+            Request::Record {
+                device: device(),
+                file_path: rec.clone(),
+                format: Some(OutputFormat::Wav),
+                duration_secs: Some(0.02),
+                sample_rate: None,
+                channels: None,
+            },
+            Request::Stop { device: device() },
+        ];
+        for req in &requests {
+            let sent = async { TestClient::connect(&socket).await?.send(req).await }.await;
+            if let Some(status) = guard.child.try_wait()? {
+                panic!("daemon died at cycle {cycle} ({status})");
+            }
+            sent.with_context(|| format!("cycle {cycle}: {req:?}"))?;
+            // Let a process cycle start on the new job before Stop arrives.
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_stream_in_with_frequency_validation() -> Result<()> {
     let (_guard, socket) = setup_daemon("stream-freq").await?;
