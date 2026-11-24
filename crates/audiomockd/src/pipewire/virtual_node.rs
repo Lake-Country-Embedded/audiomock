@@ -1,7 +1,5 @@
-use std::cell::RefCell;
 use std::f64::consts::PI;
-use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use anyhow::Result;
 use audiomock_proto::audio::{AudioFormat, OutputFormat, SampleFormat, WaveformKind};
@@ -58,6 +56,13 @@ fn read_sample(src: &[u8], fmt: SampleFormat) -> f32 {
     }
 }
 
+/// Lock node state from the main loop. The streams use `RT_PROCESS`, so their
+/// process callbacks run on PipeWire's data thread and only ever `try_lock`,
+/// skipping a cycle rather than waiting on the main loop.
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Shared state for the virtual source, accessible from both commands and callbacks.
 pub struct SourceState {
     pub format: AudioFormat,
@@ -102,11 +107,11 @@ pub struct DevicePair {
     pub name: String,
     pub source_description: String,
     pub sink_description: String,
-    pub source_state: Rc<RefCell<SourceState>>,
-    pub sink_state: Rc<RefCell<SinkState>>,
+    pub source_state: Arc<Mutex<SourceState>>,
+    pub sink_state: Arc<Mutex<SinkState>>,
     _source_stream: Stream,
     _sink_stream: Stream,
-    // StreamListener is parameterized with () since we use Rc<RefCell> for state
+    // StreamListener is parameterized with () since the state lives in Arc<Mutex>
     _source_listener: pw::stream::StreamListener<()>,
     _sink_listener: pw::stream::StreamListener<()>,
 }
@@ -121,7 +126,7 @@ impl DevicePair {
         autoconnect: bool,
         buffer_size: u32,
     ) -> Result<Self> {
-        let source_state = Rc::new(RefCell::new(SourceState {
+        let source_state = Arc::new(Mutex::new(SourceState {
             format: *audio_format,
             active_job: None,
             tone_phase: 0.0,
@@ -138,7 +143,7 @@ impl DevicePair {
             stream_in_buffer: None,
         }));
 
-        let sink_state = Rc::new(RefCell::new(SinkState {
+        let sink_state = Arc::new(Mutex::new(SinkState {
             format: *audio_format,
             active_job: None,
             recorder: None,
@@ -246,8 +251,8 @@ impl DevicePair {
     }
 
     pub fn info(&self) -> DeviceInfo {
-        let src = self.source_state.borrow();
-        let snk = self.sink_state.borrow();
+        let src = lock(&self.source_state);
+        let snk = lock(&self.sink_state);
         // Show source active job, or sink active job
         let active_job = src.active_job.clone().or_else(|| snk.active_job.clone());
         DeviceInfo {
@@ -263,7 +268,7 @@ impl DevicePair {
     /// Called from the daemon's command timer.
     pub fn poll(&mut self) {
         if tracing::enabled!(tracing::Level::DEBUG)
-            && let Ok(st) = self.sink_state.try_borrow()
+            && let Ok(st) = self.sink_state.try_lock()
             && let Some(rb) = st.loopback_buffer.as_ref()
         {
             tracing::debug!(
@@ -273,7 +278,7 @@ impl DevicePair {
             );
         }
         let finished = {
-            let mut st = match self.sink_state.try_borrow_mut() {
+            let mut st = match self.sink_state.try_lock() {
                 Ok(s) => s,
                 Err(_) => return,
             };
@@ -303,7 +308,7 @@ impl DevicePair {
         volume: f32,
         duration_secs: Option<f64>,
     ) {
-        let mut state = self.source_state.borrow_mut();
+        let mut state = lock(&self.source_state);
         let duration_samples =
             duration_secs.map(|d| (d * state.format.sample_rate as f64) as u64);
         state.active_job = Some(ActiveJob::Tone {
@@ -325,14 +330,14 @@ impl DevicePair {
 
     pub fn stop_job(&mut self) {
         {
-            let mut state = self.source_state.borrow_mut();
+            let mut state = lock(&self.source_state);
             state.active_job = None;
             state.playback_buffer.clear();
             state.playback_pos = 0;
             state.stream_in_buffer = None;
         }
         let recorder = {
-            let mut state = self.sink_state.borrow_mut();
+            let mut state = lock(&self.sink_state);
             state.active_job = None;
             state.stream_out_buffer = None;
             state.loopback_buffer = None;
@@ -354,10 +359,10 @@ impl DevicePair {
         loop_count: Option<u32>,
         volume: f32,
     ) -> Result<()> {
-        let format = self.source_state.borrow().format;
+        let format = lock(&self.source_state).format;
         let samples = crate::audio::decoder::decode_file(file_path, &format)?;
 
-        let mut state = self.source_state.borrow_mut();
+        let mut state = lock(&self.source_state);
         state.playback_buffer = samples;
         state.playback_pos = 0;
         state.playback_loop_count = loop_count;
@@ -378,7 +383,7 @@ impl DevicePair {
         let rb = RingBuffer::new(96000);
         match direction {
             StreamDirection::In => {
-                let mut state = self.source_state.borrow_mut();
+                let mut state = lock(&self.source_state);
                 state.stream_in_buffer = Some(rb.clone());
                 state.active_job = Some(ActiveJob::Streaming {
                     direction: StreamDirection::In,
@@ -386,7 +391,7 @@ impl DevicePair {
                 tracing::info!("Started stream-in on '{}'", self.name);
             }
             StreamDirection::Out => {
-                let mut state = self.sink_state.borrow_mut();
+                let mut state = lock(&self.sink_state);
                 state.stream_out_buffer = Some(rb.clone());
                 state.active_job = Some(ActiveJob::Streaming {
                     direction: StreamDirection::Out,
@@ -406,12 +411,12 @@ impl DevicePair {
         let rb = RingBuffer::new(LOOPBACK_CAPACITY);
         rb.write(&vec![0.0f32; LOOPBACK_PRIME]);
         {
-            let mut sink = self.sink_state.borrow_mut();
+            let mut sink = lock(&self.sink_state);
             sink.loopback_buffer = Some(rb.clone());
             sink.active_job = Some(ActiveJob::Loopback);
         }
         {
-            let mut src = self.source_state.borrow_mut();
+            let mut src = lock(&self.source_state);
             src.stream_in_buffer = Some(rb);
             src.active_job = Some(ActiveJob::Loopback);
         }
@@ -426,7 +431,7 @@ impl DevicePair {
         sample_rate: Option<u32>,
         channels: Option<u16>,
     ) -> Result<()> {
-        let format = self.sink_state.borrow().format;
+        let format = lock(&self.sink_state).format;
         let recorder = Recorder::start(
             file_path,
             out_format,
@@ -435,7 +440,7 @@ impl DevicePair {
             channels,
         )?;
 
-        let mut state = self.sink_state.borrow_mut();
+        let mut state = lock(&self.sink_state);
         state.record_limit_samples = duration_secs.map(|d| {
             (d * format.sample_rate as f64) as u64 * format.channels as u64
         });
@@ -459,7 +464,7 @@ impl DevicePair {
     }
 }
 
-fn source_process(stream: &StreamRef, state: &Rc<RefCell<SourceState>>) {
+fn source_process(stream: &StreamRef, state: &Mutex<SourceState>) {
     let mut buffer = match stream.dequeue_buffer() {
         Some(b) => b,
         None => return,
@@ -481,7 +486,7 @@ fn source_process(stream: &StreamRef, state: &Rc<RefCell<SourceState>>) {
 
     // Read the format before borrowing the buffer slice mutably.
     let (channels, sample_fmt) = {
-        match state.try_borrow() {
+        match state.try_lock() {
             Ok(st) => (st.format.channels as usize, st.format.sample_format),
             Err(_) => return,
         }
@@ -496,12 +501,12 @@ fn source_process(stream: &StreamRef, state: &Rc<RefCell<SourceState>>) {
         } else {
             capacity_frames
         };
-        // Use try_borrow_mut to avoid panicking if a command handler
-        // currently holds the borrow (timer + process callback can overlap).
-        let mut st = match state.try_borrow_mut() {
+        // Never wait on the main loop from the real-time thread: if a
+        // command holds the state, skip this cycle.
+        let mut st = match state.try_lock() {
             Ok(s) => s,
             Err(_) => {
-                slice.fill(0); // Output silence if we can't borrow
+                slice.fill(0); // Output silence while a command holds the state
                 return;
             }
         };
@@ -648,7 +653,7 @@ fn fill_silence(
     }
 }
 
-fn sink_process(stream: &StreamRef, state: &Rc<RefCell<SinkState>>) {
+fn sink_process(stream: &StreamRef, state: &Mutex<SinkState>) {
     let mut buffer = match stream.dequeue_buffer() {
         Some(b) => b,
         None => return,
@@ -663,16 +668,16 @@ fn sink_process(stream: &StreamRef, state: &Rc<RefCell<SinkState>>) {
     // Read chunk size before taking the mutable slice reference
     let chunk_size = data.chunk().size() as usize;
 
-    let sample_fmt = match state.try_borrow() {
+    let sample_fmt = match state.try_lock() {
         Ok(st) => st.format.sample_format,
         Err(_) => return,
     };
     let bps = sample_fmt.bytes_per_sample();
 
     if let Some(slice) = data.data() {
-        // Use try_borrow_mut to avoid panicking if a command handler
-        // currently holds the borrow (timer + process callback can overlap).
-        let mut st = match state.try_borrow_mut() {
+        // Never wait on the main loop from the real-time thread: if a
+        // command holds the state, skip this cycle.
+        let mut st = match state.try_lock() {
             Ok(s) => s,
             Err(_) => return, // Skip this buffer; command in progress
         };
